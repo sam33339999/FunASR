@@ -2,6 +2,7 @@
 
 Provides OpenAI-compatible API (/v1/audio/transcriptions) and REST API (/asr).
 Uses vLLM for Fun-ASR-Nano (GPU) or falls back to AutoModel for non-LLM models (SenseVoice/Paraformer).
+Speaker diarization support via CAM++ model.
 """
 
 import io
@@ -30,11 +31,13 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
     if preload_model == "auto":
         preload_model = "fun-asr-nano" if device.startswith("cuda") else "sensevoice"
 
-    app = FastAPI(title="FunASR Server", version="1.3.6")
+    app = FastAPI(title="FunASR Server", version="1.4.0-spk")
     app.state.device = device
     app.state.engine = None
     app.state.vad_model = None
+    app.state.spk_model = None
     app.state.fallback_models = {}
+    app.state.spk_fallback_models = {}
 
     # Non-LLM model configs (use AutoModel, no vLLM)
     FALLBACK_CONFIGS = {
@@ -90,8 +93,54 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
             app.state.fallback_models["fun-asr-nano"] = AutoModel(**cfg)
             logger.info("Fallback AutoModel loaded for fun-asr-nano.")
 
+    def _load_spk_model():
+        """Load CAM++ speaker model (shared across all ASR models)."""
+        if app.state.spk_model is not None:
+            return
+        from funasr import AutoModel
+        logger.info("Loading speaker diarization model (CAM++)...")
+        t0 = time.time()
+        app.state.spk_model = AutoModel(
+            model="funasr/campplus",
+            hub="hf",
+            device=device,
+            disable_update=True,
+        )
+        logger.info(f"Speaker model ready in {time.time()-t0:.1f}s")
+
+    def _get_spk_fallback(name: str):
+        """Get or create fallback model WITH speaker diarization."""
+        if name in app.state.spk_fallback_models:
+            return app.state.spk_fallback_models[name]
+        if name not in FALLBACK_CONFIGS and name != "fun-asr-nano":
+            return None
+        _load_spk_model()
+        from funasr import AutoModel
+
+        if name == "fun-asr-nano":
+            cfg = {
+                "model": "FunAudioLLM/Fun-ASR-Nano-2512",
+                "hub": "hf",
+                "trust_remote_code": True,
+                "vad_model": "fsmn-vad",
+                "vad_kwargs": {"max_single_segment_time": 30000},
+                "spk_model": "funasr/campplus",
+                "device": device,
+                "disable_update": True,
+            }
+        else:
+            cfg = FALLBACK_CONFIGS[name].copy()
+            cfg["spk_model"] = "funasr/campplus"
+            cfg["device"] = device
+            cfg["disable_update"] = True
+
+        logger.info(f"Loading spk-enabled fallback model '{name}'...")
+        model = AutoModel(**cfg)
+        app.state.spk_fallback_models[name] = model
+        return model
+
     def _load_fallback(name: str):
-        """Load non-LLM model via AutoModel."""
+        """Load non-LLM model via AutoModel (no speaker diarization)."""
         if name in app.state.fallback_models:
             return app.state.fallback_models[name]
         if name not in FALLBACK_CONFIGS:
@@ -106,7 +155,21 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
         return model
 
     def _process_vllm(audio_data, sr, language=None, hotwords=None, use_spk=False):
-        """Process audio with vLLM engine (Fun-ASR-Nano)."""
+        """Process audio with vLLM engine (Fun-ASR-Nano). Falls back to AutoModel for spk."""
+        # For speaker diarization, fall back to AutoModel (vLLM doesn't support spk natively)
+        if use_spk:
+            suffix = ".wav"
+            import tempfile as tmpfile_mod
+            with tmpfile_mod.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                sf.write(tmp.name, audio_data, sr)
+                tmp_path = tmp.name
+            try:
+                model = _get_spk_fallback("fun-asr-nano")
+                result = model.generate(input=tmp_path, batch_size=1)
+                return _extract_fallback_result(result)
+            finally:
+                os.unlink(tmp_path)
+
         if sr != 16000:
             import librosa
             audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=16000)
@@ -132,9 +195,6 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
         if not seg_audios:
             return {"text": "", "segments": [], "duration": len(audio_data)/sr}
 
-        # repetition_penalty is left at the neutral 1.0: the Fun-ASR-Nano vLLM
-        # engine runs in prompt-embeds mode, where any other value crashes the
-        # CUDA kernel (see issue #2948 and fun_asr_nano.vllm_utils).
         gen_kwargs = {"max_new_tokens": 500, "repetition_penalty": 1.0}
         if language:
             gen_kwargs["language"] = language
@@ -163,24 +223,71 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
             "duration": len(audio_data) / sr,
         }
 
-    def _process_fallback(model_name, audio_path, language=None):
-        """Process with non-LLM model (SenseVoice/Paraformer)."""
-        model = _load_fallback(model_name)
-        kwargs = {"input": audio_path, "batch_size": 1}
-        if language:
-            kwargs["language"] = language
-        result = model.generate(**kwargs)
-        text = re.sub(r'<\|[^|]*\|>', '', result[0]["text"]).strip()
+    def _extract_fallback_result(result):
+        """Extract text and segments from AutoModel result (with or without spk)."""
+        import re
+        r = result[0]
+        text = re.sub(r'<\|[^|]*\|>', '', r.get("text", "")).strip()
+        duration = 0
         segments = []
-        if "sentence_info" in result[0]:
-            for s in result[0]["sentence_info"]:
+
+        if "sentence_info" in r:
+            for s in r["sentence_info"]:
+                start_s = s.get("start", 0) / 1000
+                end_s = s.get("end", 0) / 1000
+                if end_s > duration:
+                    duration = end_s
                 segments.append({
-                    "start": s.get("start", 0)/1000,
-                    "end": s.get("end", 0)/1000,
-                    "text": re.sub(r'<\|[^|]*\|>', '', s.get("text", "")).strip(),
+                    "start": start_s,
+                    "end": end_s,
+                    "text": re.sub(r'<\|[^|]*\|>', '', s.get("text", s.get("sentence", ""))).strip(),
                     "speaker": s.get("spk"),
                 })
-        return {"text": text, "segments": segments}
+        elif "segments" in r:
+            for seg in r["segments"]:
+                start_s = seg.get("start", 0)
+                end_s = seg.get("end", 0)
+                if isinstance(start_s, (int, float)):
+                    start_s = start_s if start_s > 1 else start_s  # already in seconds
+                if isinstance(end_s, (int, float)):
+                    end_s = end_s if end_s > 1 else end_s
+                if end_s > duration:
+                    duration = end_s
+                if isinstance(start_s, (int, float)) and start_s < 1:
+                    start_s = start_s * 1000  # ms -> s
+                if isinstance(end_s, float) and end_s < 1000:
+                    pass
+                segments.append({
+                    "start": start_s if isinstance(start_s, (int, float)) else 0,
+                    "end": end_s if isinstance(end_s, (int, float)) else 0,
+                    "text": re.sub(r'<\|[^|]*\|>', '', seg.get("text", "")).strip(),
+                    "speaker": seg.get("speaker", seg.get("spk")),
+                })
+        else:
+            duration = r.get("duration", 0)
+
+        return {
+            "text": text,
+            "segments": segments,
+            "duration": duration,
+        }
+
+    def _process_fallback(model_name, audio_path, language=None, use_spk=False):
+        """Process with non-LLM model (SenseVoice/Paraformer). Supports speaker diarization."""
+        if use_spk:
+            model = _get_spk_fallback(model_name)
+            kwargs = {"input": audio_path, "batch_size": 1}
+            if language:
+                kwargs["language"] = language
+            result = model.generate(**kwargs)
+            return _extract_fallback_result(result)
+        else:
+            model = _load_fallback(model_name)
+            kwargs = {"input": audio_path, "batch_size": 1}
+            if language:
+                kwargs["language"] = language
+            result = model.generate(**kwargs)
+            return _extract_fallback_result(result)
 
     # Pre-load
     if preload_model == "fun-asr-nano":
@@ -201,7 +308,17 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
 
         if model == "fun-asr-nano":
             _load_vllm_engine()
-            if app.state.use_vllm:
+            if spk and not app.state.use_vllm:
+                # Already in fallback mode, use spk variant
+                suffix = os.path.splitext(file.filename)[1] if file.filename else ".wav"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(content)
+                    tmp_path = tmp.name
+                try:
+                    result = _process_fallback("fun-asr-nano", tmp_path, language=language, use_spk=True)
+                finally:
+                    os.unlink(tmp_path)
+            elif app.state.use_vllm:
                 audio_data, sr = sf.read(io.BytesIO(content))
                 result = _process_vllm(audio_data, sr, language=language, use_spk=spk)
             else:
@@ -210,7 +327,7 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
                     tmp.write(content)
                     tmp_path = tmp.name
                 try:
-                    result = _process_fallback("fun-asr-nano", tmp_path, language=language)
+                    result = _process_fallback("fun-asr-nano", tmp_path, language=language, use_spk=spk)
                 finally:
                     os.unlink(tmp_path)
         elif model in FALLBACK_CONFIGS:
@@ -219,7 +336,7 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
                 tmp.write(content)
                 tmp_path = tmp.name
             try:
-                result = _process_fallback(model, tmp_path, language=language)
+                result = _process_fallback(model, tmp_path, language=language, use_spk=spk)
             finally:
                 os.unlink(tmp_path)
         else:
@@ -228,16 +345,31 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
         t1 = time.perf_counter()
 
         if response_format == "verbose_json":
-            return JSONResponse({
+            segs = []
+            for i, s in enumerate(result.get("segments", [])):
+                seg = {
+                    "id": i,
+                    "start": s["start"],
+                    "end": s["end"],
+                    "text": s["text"],
+                    "words": s.get("words", []),
+                }
+                if s.get("speaker") is not None and s["speaker"] >= 0:
+                    seg["speaker"] = s["speaker"]
+                segs.append(seg)
+
+            resp = {
                 "task": "transcribe",
                 "language": language or "zh",
                 "duration": result.get("duration", 0),
                 "text": result["text"],
-                "segments": [
-                    {"id": i, "start": s["start"], "end": s["end"], "text": s["text"], "words": s.get("words", [])}
-                    for i, s in enumerate(result["segments"])
-                ],
-            })
+                "segments": segs,
+            }
+            if spk:
+                speakers = set(s.get("speaker") for s in result.get("segments", []) if s.get("speaker") is not None)
+                if speakers:
+                    resp["speakers"] = sorted(speakers)
+            return JSONResponse(resp)
         elif response_format == "text":
             return JSONResponse(result["text"])
         else:
@@ -256,7 +388,16 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
         hw_list = [w.strip() for w in hotwords.split(",") if w.strip()] if hotwords else None
 
         t0 = time.perf_counter()
-        if app.state.use_vllm:
+        if spk and not app.state.use_vllm:
+            suffix = ".wav"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            try:
+                result = _process_fallback("fun-asr-nano", tmp_path, language=language, use_spk=True)
+            finally:
+                os.unlink(tmp_path)
+        elif app.state.use_vllm:
             audio_data, sr = sf.read(io.BytesIO(content))
             result = _process_vllm(audio_data, sr, language=language, hotwords=hw_list, use_spk=spk)
         else:
@@ -265,7 +406,7 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
                 tmp.write(content)
                 tmp_path = tmp.name
             try:
-                result = _process_fallback("fun-asr-nano", tmp_path, language=language)
+                result = _process_fallback("fun-asr-nano", tmp_path, language=language, use_spk=spk)
             finally:
                 os.unlink(tmp_path)
         t1 = time.perf_counter()
@@ -285,6 +426,10 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
         if app.state.engine is not None:
             loaded.append("fun-asr-nano (vLLM)")
         loaded.extend(app.state.fallback_models.keys())
+        if app.state.spk_model is not None:
+            loaded.append("spk (CAM++)")
+        if app.state.spk_fallback_models:
+            loaded.append(f"spk models: {list(app.state.spk_fallback_models.keys())}")
         return {"status": "ok", "device": device, "models_loaded": loaded}
 
     return app

@@ -35,7 +35,6 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
     app.state.device = device
     app.state.engine = None
     app.state.vad_model = None
-    app.state.spk_model = None
     app.state.fallback_models = {}
     app.state.spk_fallback_models = {}
 
@@ -93,28 +92,12 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
             app.state.fallback_models["fun-asr-nano"] = AutoModel(**cfg)
             logger.info("Fallback AutoModel loaded for fun-asr-nano.")
 
-    def _load_spk_model():
-        """Load CAM++ speaker model (shared across all ASR models)."""
-        if app.state.spk_model is not None:
-            return
-        from funasr import AutoModel
-        logger.info("Loading speaker diarization model (CAM++)...")
-        t0 = time.time()
-        app.state.spk_model = AutoModel(
-            model="funasr/campplus",
-            hub="hf",
-            device=device,
-            disable_update=True,
-        )
-        logger.info(f"Speaker model ready in {time.time()-t0:.1f}s")
-
     def _get_spk_fallback(name: str):
         """Get or create fallback model WITH speaker diarization."""
         if name in app.state.spk_fallback_models:
             return app.state.spk_fallback_models[name]
         if name not in FALLBACK_CONFIGS and name != "fun-asr-nano":
             return None
-        _load_spk_model()
         from funasr import AutoModel
 
         if name == "fun-asr-nano":
@@ -165,7 +148,12 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
                 tmp_path = tmp.name
             try:
                 model = _get_spk_fallback("fun-asr-nano")
-                result = model.generate(input=tmp_path, batch_size=1)
+                kwargs = {"input": tmp_path, "batch_size": 1}
+                if language:
+                    kwargs["language"] = language
+                if hotwords:
+                    kwargs["hotwords"] = hotwords
+                result = model.generate(**kwargs)
                 return _extract_fallback_result(result)
             finally:
                 os.unlink(tmp_path)
@@ -225,7 +213,6 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
 
     def _extract_fallback_result(result):
         """Extract text and segments from AutoModel result (with or without spk)."""
-        import re
         r = result[0]
         text = re.sub(r'<\|[^|]*\|>', '', r.get("text", "")).strip()
         duration = 0
@@ -242,26 +229,6 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
                     "end": end_s,
                     "text": re.sub(r'<\|[^|]*\|>', '', s.get("text", s.get("sentence", ""))).strip(),
                     "speaker": s.get("spk"),
-                })
-        elif "segments" in r:
-            for seg in r["segments"]:
-                start_s = seg.get("start", 0)
-                end_s = seg.get("end", 0)
-                if isinstance(start_s, (int, float)):
-                    start_s = start_s if start_s > 1 else start_s  # already in seconds
-                if isinstance(end_s, (int, float)):
-                    end_s = end_s if end_s > 1 else end_s
-                if end_s > duration:
-                    duration = end_s
-                if isinstance(start_s, (int, float)) and start_s < 1:
-                    start_s = start_s * 1000  # ms -> s
-                if isinstance(end_s, float) and end_s < 1000:
-                    pass
-                segments.append({
-                    "start": start_s if isinstance(start_s, (int, float)) else 0,
-                    "end": end_s if isinstance(end_s, (int, float)) else 0,
-                    "text": re.sub(r'<\|[^|]*\|>', '', seg.get("text", "")).strip(),
-                    "speaker": seg.get("speaker", seg.get("spk")),
                 })
         else:
             duration = r.get("duration", 0)
@@ -366,7 +333,10 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
                 "segments": segs,
             }
             if spk:
-                speakers = set(s.get("speaker") for s in result.get("segments", []) if s.get("speaker") is not None)
+                speakers = set(
+                    s.get("speaker") for s in result.get("segments", [])
+                    if s.get("speaker") is not None and s["speaker"] >= 0
+                )
                 if speakers:
                     resp["speakers"] = sorted(speakers)
             return JSONResponse(resp)
@@ -426,8 +396,6 @@ def create_app(device: str = "cuda", preload_model: str = "auto") -> FastAPI:
         if app.state.engine is not None:
             loaded.append("fun-asr-nano (vLLM)")
         loaded.extend(app.state.fallback_models.keys())
-        if app.state.spk_model is not None:
-            loaded.append("spk (CAM++)")
         if app.state.spk_fallback_models:
             loaded.append(f"spk models: {list(app.state.spk_fallback_models.keys())}")
         return {"status": "ok", "device": device, "models_loaded": loaded}
